@@ -1,0 +1,21 @@
+type: entities
+title: Управление лицами FM22x
+entities:
+  - entity: text.face_recognition_imia_dlia_novogo_litsa
+    name: Имя нового пользователя (латиницей)
+  - entity: button.face_recognition_start_enrollment_button
+    name: Запустить добавление лица
+  - entity: sensor.face_recognition_enrollment_instruction
+    name: Инструкция
+  - entity: button.face_recognition_scan_button
+    name: Сканировать сейчас
+  - entity: sensor.face_recognition_last_face_name
+    name: Кто в кадре
+  - entity: sensor.face_recognition_last_face_id
+    name: ID пользователя в базе
+  - entity: text.face_recognition_face_names
+    name: Список имён (ID=имя)
+  - entity: number.face_recognition_id_dlia_udaleniia
+    name: Выберите ID для удаления
+  - entity: button.face_recognition_delete_user_button
+    name: Удалить этого пользователя

@@ -1,0 +1,413 @@
+# Пауза перед следующим ракурсом регистрации: время, чтобы успеть занять позу
+substitutions:
+  step_pause: 3s
+  # Режим регистрации. По протоколу FM22x direction - это ОДНО значение
+  # (1/2/4/8/16), а не сумма битов, поэтому всегда "1": ракурсы идут по очереди.
+  enroll_start_step: "1"
+
+esphome:
+  name: face-recognition
+  friendly_name: Face Recognition
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+# Глобальные переменные для умной пошаговой регистрации
+globals:
+  - id: current_enroll_name
+    type: std::string
+  - id: current_step
+    type: int
+  - id: enroll_fails
+    type: int
+    initial_value: '0'
+
+logger:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  output_power: 8.5
+  ap:
+    ssid: "Face-Recognition"
+    password: !secret ap_password
+
+captive_portal:
+
+uart:
+  id: uart_bus
+  rx_pin: GPIO12
+  tx_pin: GPIO13
+  baud_rate: 115200
+  debug:
+    direction: BOTH
+    sequence:
+       - lambda: UARTDebug::log_hex(direction, bytes, ';');
+
+# Текстовое поле ввода имени (изначально пустое)
+text:
+  - platform: template
+    name: "Имя для нового лица"
+    id: new_user_name
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 20
+    initial_value: ""
+
+  # Таблица соответствия ID -> имя, формат "1=alleon;2=anna;".
+  # Модуль имя при распознавании не возвращает, поэтому имена храним сами.
+  # Заполняется автоматически при регистрации, при необходимости можно править вручную в HA.
+  - platform: template
+    name: "Face Names"
+    id: face_names
+    icon: "mdi:account-details"
+    mode: text
+    optimistic: true
+    restore_value: true
+    min_length: 0
+    max_length: 255
+    initial_value: ""
+
+# Числовое поле для выбора ID для удаления
+number:
+  - platform: template
+    name: "ID для удаления"
+    id: delete_user_id
+    optimistic: true
+    mode: box
+    min_value: 1
+    max_value: 100
+    step: 1
+    initial_value: 1
+
+# Единый сценарий запуска регистрации (кнопка и API-действие используют его)
+script:
+  - id: start_enroll_script
+    parameters:
+      user_name: string
+    then:
+      - hlk_fm22x.reset:
+      - delay: 1s
+      - globals.set:
+          id: current_enroll_name
+          value: !lambda 'return user_name;'
+      - globals.set:
+          id: current_step
+          value: !lambda 'return ${enroll_start_step};'
+      - globals.set:
+          id: enroll_fails
+          value: !lambda 'return 0;'
+      - lambda: |-
+          if (id(current_step) == 31) {
+            id(enroll_instruction).publish_state("Смотрите в камеру и МЕДЛЕННО поворачивайте голову: вправо, влево, вниз, вверх");
+          } else {
+            id(enroll_instruction).publish_state("Смотрите ПРЯМО в камеру...");
+          }
+      - delay: 500ms
+      - hlk_fm22x.enroll:
+          name: !lambda 'return user_name;'
+          direction: !lambda 'return id(current_step);'
+
+  # Записать пару "ID=имя" (заменяет старую запись с тем же ID)
+  - id: save_face_name
+    parameters:
+      fid: int
+      fname: string
+    then:
+      - lambda: |-
+          std::string old = id(face_names).state;
+          std::string key = std::to_string(fid) + "=";
+          std::string out;
+          size_t pos = 0;
+          while (pos < old.size()) {
+            size_t end = old.find(';', pos);
+            if (end == std::string::npos) end = old.size();
+            if (end > pos && old.compare(pos, key.size(), key) != 0) {
+              out += old.substr(pos, end - pos) + ";";
+            }
+            pos = end + 1;
+          }
+          out += key + fname + ";";
+          if (out.size() > 255) {
+            ESP_LOGW("face", "names list is full, cannot save name for id %d", (int) fid);
+            id(enroll_instruction).publish_state("Лицо сохранено, но список имён переполнен");
+          } else {
+            id(face_names).make_call().set_value(out).perform();
+          }
+
+  # Удалить запись с указанным ID
+  - id: remove_face_name
+    parameters:
+      fid: int
+    then:
+      - lambda: |-
+          std::string old = id(face_names).state;
+          std::string key = std::to_string(fid) + "=";
+          std::string out;
+          size_t pos = 0;
+          while (pos < old.size()) {
+            size_t end = old.find(';', pos);
+            if (end == std::string::npos) end = old.size();
+            if (end > pos && old.compare(pos, key.size(), key) != 0) {
+              out += old.substr(pos, end - pos) + ";";
+            }
+            pos = end + 1;
+          }
+          id(face_names).make_call().set_value(out).perform();
+
+api:
+  actions:
+    - action: enroll
+      variables:
+        name: string
+        direction: int
+      then:
+        - hlk_fm22x.enroll:
+            name: !lambda 'return name;'
+            direction: !lambda 'return direction;'
+    - action: scan
+      then:
+        - hlk_fm22x.scan:
+    - action: delete
+      variables:
+        face_id: int
+      then:
+        - hlk_fm22x.delete:
+            face_id: !lambda 'return face_id;'
+        - script.execute:
+            id: remove_face_name
+            fid: !lambda 'return face_id;'
+    - action: delete_all
+      then:
+        - hlk_fm22x.delete_all:
+        - text.set:
+            id: face_names
+            value: ""
+    - action: reset
+      then:
+        - hlk_fm22x.reset:
+    - action: start_enrollment
+      variables:
+        user_name: string
+      then:
+        - script.execute:
+            id: start_enroll_script
+            user_name: !lambda 'return user_name;'
+
+hlk_fm22x:
+  id: my_fm223
+  uart_id: uart_bus
+
+  on_face_scan_invalid:
+    - homeassistant.event:
+        event: esphome.face_scan_invalid
+        data:
+          error: !lambda 'return error;'
+    - lambda: |-
+        id(last_face_name).publish_state("Ошибка сканирования (лицо не найдено)");
+
+  on_face_scan_matched:
+    - homeassistant.event:
+        event: esphome.face_scan_matched
+        data:
+          face_id: !lambda 'return face_id;'
+          name: !lambda 'return name;'
+    # Имя берём из нашей таблицы ID -> имя; если там нет, пробуем имя из модуля (обычно пустое)
+    - lambda: |-
+        std::string n(name.c_str());
+        std::string map = id(face_names).state;
+        std::string key = std::to_string(face_id) + "=";
+        std::string found;
+        size_t pos = 0;
+        while (pos < map.size()) {
+          size_t end = map.find(';', pos);
+          if (end == std::string::npos) end = map.size();
+          if (map.compare(pos, key.size(), key) == 0) {
+            found = map.substr(pos + key.size(), end - pos - key.size());
+            break;
+          }
+          pos = end + 1;
+        }
+        ESP_LOGD("face", "matched: id=%d, module_name='%s', stored_name='%s'", face_id, n.c_str(), found.c_str());
+        if (!found.empty()) {
+          id(last_face_name).publish_state(found);
+        } else if (!n.empty()) {
+          id(last_face_name).publish_state(n);
+        } else {
+          id(last_face_name).publish_state("ID " + std::to_string(face_id) + " (имя не задано)");
+        }
+
+  on_face_scan_unmatched:
+    - homeassistant.event:
+        event: esphome.face_scan_unmatched
+    - lambda: |-
+        id(last_face_name).publish_state("Неизвестное лицо");
+
+  on_face_info:
+    - homeassistant.event:
+        event: esphome.face_info
+        data:
+          status: !lambda 'return status;'
+          left: !lambda 'return left;'
+          top: !lambda 'return top;'
+          right: !lambda 'return right;'
+          bottom: !lambda 'return bottom;'
+          yaw: !lambda 'return yaw;'
+          pitch: !lambda 'return pitch;'
+          roll: !lambda 'return roll;'
+
+  on_enrollment_done:
+    - homeassistant.event:
+        event: esphome.enrollment_done
+        data:
+          face_id: !lambda 'return face_id;'
+          direction: !lambda 'return direction;'
+    # Успех засчитываем только если модуль собрал все 5 ракурсов (тогда он выдаёт настоящий ID, а не -1)
+    - lambda: |-
+        ESP_LOGD("face", "enroll step done: id=%d, dir=0x%02X, step=%d", face_id, (int) direction, id(current_step));
+        if (face_id >= 0) {
+          id(current_step) = 0;
+          id(enroll_instruction).publish_state("Лицо сохранено! ID " + std::to_string(face_id) + " (" + id(current_enroll_name) + ")");
+        } else if (id(current_step) == 31) {
+          id(current_step) = 0;
+          id(enroll_instruction).publish_state("НЕ сохранено: модуль не собрал все ракурсы. Нажмите старт ещё раз");
+        } else if (id(current_step) == 1) {
+          id(current_step) = 2;
+          id(enroll_instruction).publish_state("Успешно! Теперь поверните голову ВПРАВО");
+        } else if (id(current_step) == 2) {
+          id(current_step) = 4;
+          id(enroll_instruction).publish_state("Успешно! Теперь поверните голову ВЛЕВО");
+        } else if (id(current_step) == 4) {
+          id(current_step) = 8;
+          id(enroll_instruction).publish_state("Успешно! Наклоните голову ВНИЗ");
+        } else if (id(current_step) == 8) {
+          id(current_step) = 16;
+          id(enroll_instruction).publish_state("Успешно! Поднимите голову ВВЕРХ");
+        } else if (id(current_step) == 16) {
+          id(current_step) = 0;
+          id(enroll_instruction).publish_state("НЕ сохранено: модуль не собрал все ракурсы. Нажмите старт ещё раз");
+        }
+    - if:
+        condition:
+          lambda: 'return face_id >= 0;'
+        then:
+          - script.execute:
+              id: save_face_name
+              fid: !lambda 'return face_id;'
+              fname: !lambda 'return id(current_enroll_name);'
+    - if:
+        condition:
+          lambda: 'return id(current_step) > 0;'
+        then:
+          - delay: ${step_pause}
+          - hlk_fm22x.enroll:
+              name: !lambda 'return id(current_enroll_name);'
+              direction: !lambda 'return id(current_step);'
+
+  on_enrollment_failed:
+    - homeassistant.event:
+        event: esphome.enrollment_failed
+        data:
+          error: !lambda 'return error;'
+    # Сбой в любом ракурсе сбрасывает уже снятые ракурсы в модуле, поэтому начинаем заново с центра
+    - if:
+        condition:
+          lambda: 'return id(current_step) > 0;'
+        then:
+          - lambda: |-
+              id(enroll_fails)++;
+              ESP_LOGD("face", "enroll failed, attempt %d", id(enroll_fails));
+              if (id(enroll_fails) > 5) {
+                id(current_step) = 0;
+                id(enroll_instruction).publish_state("Слишком много ошибок. Нажмите старт, когда будете готовы");
+              } else {
+                id(current_step) = ${enroll_start_step};
+                id(enroll_instruction).publish_state("Не получилось. Начинаем заново: смотрите в камеру...");
+              }
+          - if:
+              condition:
+                lambda: 'return id(current_step) > 0;'
+              then:
+                - delay: 2s
+                - hlk_fm22x.enroll:
+                    name: !lambda 'return id(current_enroll_name);'
+                    direction: !lambda 'return id(current_step);'
+
+sensor:
+  - platform: hlk_fm22x
+    face_count:
+      name: Face count
+    last_face_id:
+      name: Last face Id
+    status:
+      name: Status
+
+binary_sensor:
+  - platform: hlk_fm22x
+    name: Enrolling
+
+text_sensor:
+  - platform: hlk_fm22x
+    last_face_name:
+      name: Last Face Name
+      id: last_face_name
+    version:
+      name: Version
+  - platform: template
+    name: "Enrollment Instruction"
+    id: enroll_instruction
+    icon: "mdi:face-recognition"
+
+button:
+  # Кнопка ручного сканирования
+  - platform: template
+    name: Scan button
+    id: id_scan_button
+    on_press:
+      then:
+        - lambda: 'id(last_face_name).publish_state("Сканирование...");'
+        - delay: 100ms
+        - hlk_fm22x.scan:
+
+  # Кнопка старта с валидацией имени (только латиница/ASCII)
+  - platform: template
+    name: "Start Enrollment Button"
+    id: start_enroll_btn
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                const std::string &s = id(new_user_name).state;
+                if (s.empty()) return false;
+                for (unsigned char c : s) {
+                  if (c > 127 || c == ';' || c == '=') return false;
+                }
+                return true;
+            then:
+              - script.execute:
+                  id: start_enroll_script
+                  user_name: !lambda 'return id(new_user_name).state;'
+            else:
+              - lambda: 'id(enroll_instruction).publish_state("Ошибка: имя только латиницей, без русских букв, ; и =");'
+
+  # Кнопка удаления пользователя
+  - platform: template
+    name: "Delete User Button"
+    id: delete_user_btn
+    on_press:
+      then:
+        - hlk_fm22x.delete:
+            face_id: !lambda 'return (int) id(delete_user_id).state;'
+        - script.execute:
+            id: remove_face_name
+            fid: !lambda 'return (int) id(delete_user_id).state;'
+        - lambda: |-
+            id(enroll_instruction).publish_state("Пользователь с ID " + std::to_string((int) id(delete_user_id).state) + " удалён");
