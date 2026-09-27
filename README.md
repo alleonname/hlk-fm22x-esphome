@@ -41,6 +41,8 @@
 
 ## Пины UART
 
+![Распиновка UART-разъёма HLK-FM22x](uart-pins.jpg)
+
 ```yaml
 uart:
   rx_pin: GPIO12   # <- TX модуля
